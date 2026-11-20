@@ -1,0 +1,39 @@
+name: Package IMU Workbench
+on:
+  workflow_dispatch:
+  push:
+    tags: ['gui-v*']
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            interpreter: .venv/Scripts/python.exe
+            archive: zip
+          - os: ubuntu-24.04
+            interpreter: .venv/bin/python
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Create project environment
+        run: '"${{ steps.python.outputs.python-path }}" -m venv .venv'
+      - run: ${{ matrix.interpreter }} -m pip install -r requirements-build.txt
+      - run: ${{ matrix.interpreter }} tools/build_gui.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IMUWorkbench-${{ matrix.os }}-x64
+          path: dist/*.${{ matrix.archive }}
+          if-no-files-found: error
