@@ -31,7 +31,23 @@ jobs:
       - name: Create project environment
         run: '"${{ steps.python.outputs.python-path }}" -m venv .venv'
       - run: ${{ matrix.interpreter }} -m pip install -r requirements-build.txt
-      - run: ${{ matrix.interpreter }} tools/build_gui.py
+      - name: Install Qt runtime libraries on Ubuntu
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+      - name: Build and smoke-test GUI
+        run: |
+          if ! "${{ matrix.interpreter }}" tools/build_gui.py > build-gui.log 2>&1; then
+            tail -80 build-gui.log
+            while IFS= read -r line; do
+              echo "::error::${line//'%'/'%25'}"
+            done < <(tail -25 build-gui.log)
+            exit 1
+          fi
+          tail -10 build-gui.log
       - uses: actions/upload-artifact@v4
         with:
           name: IMUWorkbench-${{ matrix.os }}-x64
