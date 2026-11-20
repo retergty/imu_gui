@@ -37,7 +37,7 @@ class WorkbenchTests(unittest.TestCase):
             prefs = QSettings(str(Path(d) / 'prefs.ini'), QSettings.Format.IniFormat)
             w = Window(prefs)
             self.assertEqual([w.tabs.tabText(i) for i in range(w.tabs.count())],
-                             ['IMU 振动测试', '飞控日志', '本地分析', 'NSH 控制台'])
+                             ['IMU 振动测试', '飞控日志', '数据分析', 'NSH 控制台'])
             self.assertIs(w.tabs.currentWidget(), w.vibration)
             w.close()
             prefs.remove('ui/tabName')
@@ -46,11 +46,87 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(w.tabs.currentIndex(), 3)
             w.close()
 
+    def test_overlay_fits_disjoint_rpm_ranges_after_append(self):
+        from imu_compare import overlay
+        from matplotlib.figure import Figure
+
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            reports = {}
+            for i, points in enumerate([[(1, 1700, 1), (2, 1900, 2)],
+                                        [(1, 3200, 30)], [(0, 0, 45), (1, 600, 3)]]):
+                report = root / str(i)
+                report.mkdir()
+                with (report / 'main_rpm.csv').open('w', newline='') as stream:
+                    writer = csv.writer(stream)
+                    writer.writerow(['point', 'rpm_mean', 'accel_ac_rms_m_s2'])
+                    writer.writerows(points)
+                reports[root / f'{i}.bin'] = report
+                with patch.object(Figure, 'savefig', autospec=True) as save:
+                    overlay(reports, root)
+                    ax = save.call_args.args[0].axes[0]
+                self.assertEqual([list(line.get_xdata()) for line in ax.lines],
+                                 [[1700, 1900], [3200], [600]][:i + 1])
+                self.assertLess(ax.get_xlim()[0], [1700, 1700, 0][i])
+                self.assertGreater(ax.get_xlim()[1], [1900, 3200, 3200][i])
+                self.assertGreater(ax.get_ylim()[1], [2, 30, 45][i])
+
+    def test_compare_waveforms_in_gui(self):
+        app = QApplication.instance() or QApplication([])
+        with TemporaryDirectory() as d:
+            root = Path(d)
+            paths = [root / 'first.csv', root / 'second.csv']
+            for path, offsets in zip(paths, [[0, 0], [1, 300]]):
+                shift, rpm_offset = offsets
+                with path.open('w', newline='') as stream:
+                    out = csv.writer(stream)
+                    out.writerow('source point x y z rpm_mean rpm_min rpm_max rpm_count'.split())
+                    for p, rpm in [(2, 2000 + rpm_offset), (3, 1500)]:
+                        for x in [-1, 1]:
+                            out.writerow(['accel', p + shift, x, 0, 0, '', '', '', ''])
+                        out.writerow(['main_rpm', p + shift, '', '', '', rpm, rpm, rpm, 1])
+            prefs = QSettings(str(root / 'prefs.ini'), QSettings.Format.IniFormat)
+            prefs.setValue('ui/tabName', '本地分析')
+            w = Window(prefs)
+            self.assertEqual(w.tabs.tabText(w.tabs.currentIndex()), '数据分析')
+            def append(files):
+                with patch('imu_gui.QFileDialog.getOpenFileNames', return_value=(list(map(str, files)), '')):
+                    w.choose.click()
+                if w.analysis:
+                    loop = QEventLoop()
+                    w.analysis.finished.connect(loop.quit)
+                    QTimer.singleShot(30000, loop.quit)
+                    loop.exec()
+                    app.processEvents()
+            append(paths[:1])
+            append(paths)
+            append(paths)
+            self.assertEqual(list(w.waveforms), paths)
+            self.assertEqual(w.views.tabText(0), '主电机曲线', w.info.text())
+            self.assertFalse(w.views.widget(0).original.isNull())
+            with (w.report / 'main_rpm.csv').open() as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual([float(r['rpm_mean']) for r in rows], [1500, 2000, 1500, 2300])
+            self.assertEqual([int(r['point']) for r in rows], [3, 2, 4, 3])
+            old = w.report
+            append([root / 'missing.csv'])
+            self.assertEqual(w.report, old)
+            with patch('imu_gui.QFileDialog.getExistingDirectory', return_value=d):
+                w.save_report()
+            saved = w.saved_report
+            w.clear_btn.click()
+            self.assertEqual(w.views.count(), 0)
+            self.assertFalse(w.waveforms)
+            self.assertFalse(old.exists())
+            self.assertTrue((saved / 'main_rpm.png').is_file())
+            self.assertTrue(all(p.exists() for p in paths))
+            w.close()
+
     def test_existing_waveform_in_gui(self):
         app = QApplication.instance() or QApplication([])
         with TemporaryDirectory() as d:
             w = Window(QSettings(str(Path(d) / "prefs.ini"), QSettings.Format.IniFormat))
-            with patch('imu_gui.QFileDialog.getOpenFileName', return_value=(str(ROOT / 'logs/raw/imu01.bin'), '')), \
+            with patch('imu_gui.QFileDialog.getOpenFileNames', return_value=([str(ROOT / 'logs/raw/imu01.bin')], '')), \
                  patch('imu_gui.QFileDialog.getExistingDirectory') as select_dir:
                 w.open_local()
                 select_dir.assert_not_called()

@@ -13,13 +13,14 @@ class Analysis(QThread):
     result = Signal(object, str)
     error = Signal(str)
 
-    def __init__(self, path, folder):
+    def __init__(self, *args, operation=analyze):
         super().__init__()
-        self.args = path, folder
+        self.args = args
+        self.operation = operation
 
     def run(self):
         try:
-            self.result.emit(*analyze(*self.args))
+            self.result.emit(*self.operation(*self.args))
         except Exception as exc:
             self.error.emit(str(exc))
 

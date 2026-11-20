@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 from serial.tools.list_ports import comports
+from imu_compare import append_reports
 from imu_test_panel import VibrationPanel
 from imu_workers import Analysis, Connection
 
@@ -65,6 +66,7 @@ class Window(QMainWindow):
         self.setWindowTitle("飞控 IMU 工作台")
         self.resize(980, 680)
         self.link = self.analysis = self.report = None
+        self.waveforms = {}
         self.preview = self.saved_report = None
         self.online = self.busy = False
         root = QWidget()
@@ -102,17 +104,18 @@ class Window(QMainWindow):
         row.addWidget(self.auto)
         self.progress = QProgressBar()
         self.remote.addWidget(self.progress)
-        local = self.page("本地分析")
+        local = self.page("数据分析")
         row = QHBoxLayout()
         local.addLayout(row)
         self.choose = button(row, "打开波形 / CSV 并分析…", self.open_local)
+        self.clear_btn = button(row, "清空波形", self.clear_waveforms)
         self.save_report_btn = button(row, "保存分析结果…", self.save_report)
         self.open_report = button(
             row,
             "打开结果目录",
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.saved_report))),
         )
-        self.info = QLabel("无需连接飞控。选择 VIB2 波形或采样 CSV。")
+        self.info = QLabel('可重复打开波形或采样 CSV，按实测 RPM 叠加对比。')
         self.info.setWordWrap(True)
         local.addWidget(self.info)
         self.views = QTabWidget()
@@ -142,10 +145,12 @@ class Window(QMainWindow):
         self.device.lineEdit().setPlaceholderText("选择串口，或输入 MAVLink 地址")
         previous = self.settings.value('ui/tabName', '', type=str)
         if not previous and self.settings.contains('ui/tab'):
-            old_order = ('飞控日志', 'NSH 控制台', '本地分析', 'IMU 振动测试')
+            old_order = ('飞控日志', 'NSH 控制台', '数据分析', 'IMU 振动测试')
             index = self.settings.value('ui/tab', -1, type=int)
             if 0 <= index < len(old_order):
                 previous = old_order[index]
+        if previous == "本地分析":
+            previous = "数据分析"
         for i in range(self.tabs.count()):
             if self.tabs.tabText(i) == previous:
                 self.tabs.setCurrentIndex(i)
@@ -186,6 +191,7 @@ class Window(QMainWindow):
             if self.link
             else "未连接"
         )
+        self.clear_btn.setEnabled(self.analysis is None and self.report is not None)
         self.choose.setEnabled(self.analysis is None)
         self.save_report_btn.setEnabled(self.report is not None and self.analysis is None)
         self.open_report.setEnabled(self.saved_report is not None)
@@ -238,6 +244,7 @@ class Window(QMainWindow):
         self.link.deleteLater()
         self.link = None
         self.online = self.busy = False
+        self.vibration.reset_status_connection()
         self.entries.clear()
         self.controls()
 
@@ -289,7 +296,7 @@ class Window(QMainWindow):
         self.statusBar().showMessage(f"下载完成：{path}")
         if self.auto.isChecked():
             if self.analysis:
-                self.warn("日志已保存。本地分析正忙，请稍后手动打开。")
+                self.warn("日志已保存。数据分析正忙，请稍后手动打开。")
             else:
                 self.start_analysis(path, path.parent)
 
@@ -301,9 +308,7 @@ class Window(QMainWindow):
         self.command.setCurrentIndex(-1)
 
     def append_output(self, text):
-        self.vibration.output.moveCursor(QTextCursor.MoveOperation.End)
-        self.vibration.output.insertPlainText(text)
-        self.vibration.output.ensureCursorVisible()
+        self.vibration.receive_shell(text)
         self.console.moveCursor(QTextCursor.MoveOperation.End)
         self.console.insertPlainText(text.replace("\r", ""))
         self.console.ensureCursorVisible()
@@ -313,13 +318,45 @@ class Window(QMainWindow):
         return path if path.is_dir() else Path.home()
 
     def open_local(self):
-        name, _ = QFileDialog.getOpenFileName(
-            self, "选择波形或采样 CSV", str(self.last_dir('analysis/openDir')), "日志 (*.bin *.ulg *.csv);;所有文件 (*)"
-        )
-        if name:
-            path = Path(name)
-            self.settings.setValue('analysis/openDir', str(path.parent))
-            self.start_analysis(path)
+        names, _ = QFileDialog.getOpenFileNames(self, '选择要追加的波形或采样 CSV',
+            str(self.last_dir('analysis/openDir')), '日志 (*.bin *.ulg *.csv);;所有文件 (*)')
+        if not names:
+            return
+        paths = [p for p in dict.fromkeys(Path(n).resolve() for n in names) if p not in self.waveforms]
+        if not paths:
+            self.statusBar().showMessage('所选波形已载入，无需重复追加。', 4000)
+            return
+        self.settings.setValue('analysis/openDir', str(paths[0].parent))
+        if self.preview is None:
+            self.preview = TemporaryDirectory(prefix='imu_preview_')
+        self.run_task(Analysis(self.waveforms, paths, Path(self.preview.name), operation=append_reports),
+                      self.append_done, f'正在追加 {len(paths)} 份波形…')
+
+    def append_done(self, result, message):
+        folder, reports = result
+        if self.report and self.report not in self.waveforms.values() and self.preview and self.report.parent == Path(self.preview.name):
+            shutil.rmtree(self.report, ignore_errors=True)
+        self.waveforms = reports
+        self.source = next(iter(reports))
+        self.saved_report = None
+        self.show_report(folder, message)
+
+    def clear_views(self):
+        while self.views.count():
+            widget = self.views.widget(0)
+            self.views.removeTab(0)
+            widget.deleteLater()
+
+    def clear_waveforms(self):
+        self.remember_view()
+        self.clear_views()
+        self.waveforms.clear()
+        self.report = self.saved_report = None
+        if self.preview is not None:
+            self.preview.cleanup()
+            self.preview = None
+        self.info.setText('已清空。可重新选择波形或采样 CSV。')
+        self.controls()
 
     def save_report(self):
         folder = QFileDialog.getExistingDirectory(self, '选择报告保存位置',
@@ -348,25 +385,23 @@ class Window(QMainWindow):
         if i >= 0:
             self.settings.setValue('analysis/view', self.views.tabText(i))
 
-    def start_analysis(self, path, folder=None):
-        self.remember_view()
+    def start_analysis(self, path, folder):
+        # Download-and-analyze keeps its persistent report beside the download.
+        self.clear_waveforms()
         self.source = path
-        self.saved_report = None
-        if self.preview is not None:
-            self.preview.cleanup()
-            self.preview = None
-        if folder is None:
-            self.preview = TemporaryDirectory(prefix='imu_preview_')
-            folder = Path(self.preview.name)
+        self.run_task(Analysis(path, folder), self.download_report, f'正在处理：{path}')
+
+    def download_report(self, folder, message):
+        self.waveforms = {self.source.resolve(): folder}
+        self.saved_report = folder
+        self.show_report(folder, message)
+
+    def run_task(self, task, on_result, message):
+        self.remember_view()
         self.tabs.setCurrentIndex(2)
-        self.info.setText(f"正在处理：{path}")
-        self.report = None
-        while self.views.count():
-            w = self.views.widget(0)
-            self.views.removeTab(0)
-            w.deleteLater()
-        task = self.analysis = Analysis(path, folder)
-        task.result.connect(self.show_report)
+        self.info.setText(message)
+        self.analysis = task
+        task.result.connect(on_result)
         task.error.connect(self.analysis_error)
         task.finished.connect(self.analysis_done)
         self.controls()
@@ -383,8 +418,7 @@ class Window(QMainWindow):
     def show_report(self, folder, message):
         self.report = folder
         self.report_message = message
-        if self.preview is None:
-            self.saved_report = folder
+        self.clear_views()
         self.info.setText(f"{message}\n" + (str(folder) if self.saved_report else '当前为预览，点击“保存分析结果”可保留报告。'))
         for filename, title in [
             ("main_rpm.png", "主电机曲线"),

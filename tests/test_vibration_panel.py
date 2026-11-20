@@ -121,3 +121,71 @@ class PanelTests(unittest.TestCase):
         p.begin.click()
         confirm.assert_called_once()
         self.assertEqual(self.sent, [])
+
+    @patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes)
+    def test_status_polls_and_translates_chunked_firmware_output(self, _confirm):
+        p = self.panel
+        p.set_available(True)
+        p.begin.click()
+        self.assertTrue(p.status_poll.isActive())
+        self.assertEqual(p.status_poll.interval(), 10_000)
+        p.receive_shell('nsh> factory_test begin motor_vibration 1 1 0\r\n'
+                        'INFO  [factory_test] motor_vibration accepted; use status to observe completion\r\nnsh> ')
+        p.status_poll.timeout.emit()
+        self.assertEqual(self.sent[-1], 'factory_test status')
+        p.status.click()
+        self.assertEqual(self.sent.count('factory_test status'), 1)
+        reply = ('factory_test status\r\n\x1b[32mINFO  [factory_test] run: 7, '
+                 'command: motor_vibration, state: RUNNING\x1b[0m\r\n'
+                 'INFO  [factory_test] progress: 35%, reason: none\r\n'
+                 'INFO  [factory_test] vibration point 3: waiting for stable RPM\r\n'
+                 'INFO  [factory_test] log: active; handle: 1; run: 7; terminal: no; complete: no\r\nnsh> ')
+        for byte in reply:
+            p.receive_shell(byte)
+        rendered = p.output.toPlainText()
+        for text in ('测试进行中', '进度 35%', '第 3 测点：正在等待转速稳定', '波形：正在写入'):
+            self.assertIn(text, rendered)
+        for raw in ('nsh>', 'factory_test', 'RUNNING'):
+            self.assertNotIn(raw, rendered)
+        self.assertTrue(p.status_poll.isActive())
+
+        p.set_available(False)
+        p.status_poll.timeout.emit()
+        self.assertEqual(self.sent.count('factory_test status'), 1)
+        p.set_available(True)
+        p.status_poll.timeout.emit()
+        p.receive_shell('run: 7, command: motor_vibration, state: COMPLETE\r\n'
+                        'progress: 100%, reason: none\r\n'
+                        'log: closed; handle: 1; run: 7; terminal: yes; complete: yes\r\n'
+                        'log path: /fs/microsd/log/bench.bin; accepted/written: 512/512; errno: 0\r\nnsh> ')
+        self.assertFalse(p.status_poll.isActive())
+        self.assertIn('已保存到飞控 SD 卡', p.output.toPlainText())
+        self.assertIn('已写入 512/512 字节', p.output.toPlainText())
+
+    @patch.object(QMessageBox, 'question', return_value=QMessageBox.StandardButton.Yes)
+    def test_status_handles_rejection_timeout_abort_and_disconnect(self, _confirm):
+        p = self.panel
+        p.set_available(True)
+        p.begin.click()
+        p.receive_shell('ERROR [factory_test] motor_vibration: system is not disarmed\r\nnsh> ')
+        self.assertFalse(p.status_poll.isActive())
+        self.assertIn('飞控未处于上锁状态', p.output.toPlainText())
+        p.begin.click()
+        p.status_poll.timeout.emit()
+        p.status_timeout.stop()
+        p.status_timeout.timeout.emit()
+        self.assertIn('不能确认测试是否结束', p.output.toPlainText())
+        self.assertTrue(p.status_poll.isActive())
+        p.status_poll.timeout.emit()
+        p.receive_shell('run: 8, command: motor_vibration, state: ABORTED\r\n'
+                        'progress: 35%, reason: user abort\r\n'
+                        'log: closed; handle: 1; run: 7; terminal: yes; complete: yes\r\nnsh> ')
+        self.assertFalse(p.status_poll.isActive())
+        self.assertIn('用户请求中止', p.output.toPlainText())
+        self.assertNotIn('已保存', p.output.toPlainText())
+        p.begin.click()
+        p.status_poll.timeout.emit()
+        p.reset_status_connection()
+        self.assertFalse(p.status_poll.isActive())
+        self.assertFalse(p.status_timeout.isActive())
+        self.assertIn('测试是否结束尚未确认', p.output.toPlainText())

@@ -1,10 +1,11 @@
 """Controls for the firmware's fixed-bench motor_vibration test."""
 import re
 
-from PySide6.QtCore import Signal, QTimer, QSignalBlocker
+from PySide6.QtCore import Signal, QTimer, QSignalBlocker, Qt
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QDoubleSpinBox,
     QProxyStyle, QStyle, QVBoxLayout, QWidget)
+from imu_test_status import REASONS, StatusStream, describe_status
 
 
 DEFAULT_FILENAME = "imu_raw.bin"
@@ -65,10 +66,16 @@ class VibrationPanel(QWidget):
             actions.addWidget(btn)
             btn.clicked.connect(callback)
             return btn
-        self.prepare = add('启动产测模块', lambda: self.command.emit('factory_test start'))
+        self.prepare = add('启动产测模块', self.prepare_module)
         self.begin = add('开始振动测试…', self.start_test)
-        self.status = add('查询状态', lambda: self.command.emit('factory_test status'))
-        self.abort = add('中止测试', lambda: self.command.emit('factory_test abort'))
+        self.status = add('查询状态', self.query_status)
+        self.abort = add('中止测试', self.abort_test)
+        self.status_stream = StatusStream()
+        self.status_for_test = False
+        self.status_poll = QTimer(self, interval=10000, timerType=Qt.TimerType.PreciseTimer)
+        self.status_poll.timeout.connect(self.query_status)
+        self.status_timeout = QTimer(self, interval=5000, singleShot=True)
+        self.status_timeout.timeout.connect(self.status_unanswered)
         header = QHBoxLayout()
         self.trim_status = QLabel('舵机调整')
         header.addWidget(self.trim_status, 1)
@@ -86,7 +93,7 @@ class VibrationPanel(QWidget):
         self.trim_timer.timeout.connect(lambda: self.reset_trims('未收到飞控确认，请重新读取'))
         self.refresh_trim.clicked.connect(self.read_trims)
         self.refresh_trim.setEnabled(False)
-        layout.addWidget(QLabel('飞控 NSH 回显（是否已启动、完成或中止，以飞控状态为准）'))
+        layout.addWidget(QLabel('测试状态（开始后每 10 秒自动查询，也可手动查询）'))
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
         self.output.setMaximumBlockCount(2000)
@@ -137,6 +144,83 @@ class VibrationPanel(QWidget):
             self.reset_trims('')
             if available and self.isVisible():
                 self.read_trims()
+
+    def reset_status_connection(self):
+        if self.status_poll.isActive():
+            self.output.appendPlainText('连接已断开，已停止查询；测试是否结束尚未确认。')
+        self.status_poll.stop()
+        self.status_timeout.stop()
+        self.status_for_test = False
+        self.status_stream = StatusStream()
+
+    def prepare_module(self):
+        self.output.appendPlainText('已发送产测模块启动指令，可查询状态确认。')
+        self.command.emit('factory_test start')
+
+    def abort_test(self):
+        self.output.appendPlainText('已发送中止指令，等待飞控确认。')
+        self.command.emit('factory_test abort')
+
+    def query_status(self):
+        # The transport is reserved while listing/downloading logs.
+        if not self.status.isEnabled() or self.status_timeout.isActive():
+            return
+        self.status_for_test = self.status_poll.isActive()
+        self.status_timeout.start()
+        self.command.emit('factory_test status')
+
+    def status_unanswered(self):
+        self.status_for_test = False
+        self.output.appendPlainText('未收到可识别的飞控状态，不能确认测试是否结束。')
+
+    def receive_shell(self, text):
+        for kind, payload in self.status_stream.feed(text):
+            if kind == 'status':
+                if not self.status_timeout.isActive():
+                    continue
+                command, state, message = describe_status(payload)
+                self.status_timeout.stop()
+                if self.status_for_test and (command != 'motor_vibration' or
+                                             state in {'IDLE', 'COMPLETE', 'ABORTED'}):
+                    self.status_poll.stop()
+                self.output.appendPlainText(message)
+            else:
+                self.receive_test_message(payload)
+
+    def receive_test_message(self, line):
+        message = None
+        if line == 'motor_vibration accepted; use status to observe completion':
+            message = '飞控已受理振动测试，等待状态确认。'
+        elif line == 'command aborted':
+            message = '飞控已确认中止。'
+            self.status_poll.stop()
+            self.query_status()
+        elif line == 'no active command':
+            message = '飞控当前没有正在运行的产测。'
+            self.status_poll.stop()
+            self.query_status()
+        elif line in {'not running', 'module not running; use factory_test start'}:
+            if line != 'not running' or self.status_timeout.isActive():
+                message = '产测模块未运行，请先启动产测模块。'
+                self.status_timeout.stop()
+                self.status_poll.stop()
+        elif line == 'Task already running':
+            message = '产测模块已在运行。'
+        elif line.startswith('log writer initialization failed ('):
+            message = '产测模块启动失败：无法初始化波形写入。'
+        elif line == 'unknown calibration command: motor_vibration':
+            message = '振动测试未启动：当前固件不支持此测试。'
+            self.status_poll.stop()
+        elif line == 'another command is active' or line.startswith('motor_vibration: '):
+            reason = line.removeprefix('motor_vibration: ')
+            if reason.startswith('invalid arguments or configuration ('):
+                reason = '参数或飞控配置无效'
+            else:
+                reason = REASONS.get(reason, '飞控拒绝启动测试')
+            message = f'振动测试未启动：{reason}。'
+            self.status_poll.stop()
+        if message:
+            self.output.appendPlainText(message)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -237,4 +321,7 @@ class VibrationPanel(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if choice == QMessageBox.StandardButton.Yes and self.begin.isEnabled():
             self.remember()
+            self.status_for_test = False  # An earlier manual query cannot finish this run.
+            self.status_poll.start()
+            self.output.appendPlainText('已发送开始指令，等待飞控确认。')
             self.command.emit(cmd)
