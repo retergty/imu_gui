@@ -10,7 +10,7 @@ from imu_shell_transport import send_shell
 
 
 class Analysis(QThread):
-    result = Signal(object, str)
+    result = Signal(object, str, object)
     error = Signal(str)
 
     def __init__(self, *args, operation=analyze):
@@ -20,7 +20,8 @@ class Analysis(QThread):
 
     def run(self):
         try:
-            self.result.emit(*self.operation(*self.args))
+            figures = {}
+            self.result.emit(*self.operation(*self.args, figures=figures), figures)
         except Exception as exc:
             self.error.emit(str(exc))
 

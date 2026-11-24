@@ -20,6 +20,19 @@ class PanelTests(unittest.TestCase):
         self.sent = []
         self.panel.command.connect(self.sent.append)
 
+    def test_new_status_scrolls_to_bottom_after_reading_history(self):
+        p = self.panel
+        p.show()
+        p.output.setPlainText('历史状态\n' * 100)
+        self.app.processEvents()
+        bar = p.output.verticalScrollBar()
+        self.assertGreater(bar.maximum(), 0)
+        bar.setValue(bar.minimum())
+        p.receive_test_message('motor_vibration accepted; use status to observe completion')
+        self.app.processEvents()
+        self.assertTrue(p.output.toPlainText().endswith('飞控已受理振动测试，等待状态确认。'))
+        self.assertEqual(bar.value(), bar.maximum())
+
     def test_point_hints_follow_selection_and_mode(self):
         p = self.panel
         self.assertEqual('第 1 点：5%', p.first.toolTip())

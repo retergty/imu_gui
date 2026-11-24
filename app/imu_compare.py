@@ -8,12 +8,12 @@ from imu_point_stats import MOTORS
 from imu_workbench import analyze
 
 
-def overlay(reports, folder):
-    from matplotlib.figure import Figure
+def overlay(reports, folder, figures=None):
+    from imu_plot import report_figure, save_figure
 
     missing = []
     for motor, title in MOTORS.items():
-        fig = Figure(figsize=(10, 4.5), constrained_layout=True)
+        fig = report_figure((10, 4.5))
         ax = fig.subplots()
         rows = []
         for i, (source, report) in enumerate(reports.items(), 1):
@@ -31,7 +31,7 @@ def overlay(reports, folder):
             line, = ax.plot(*zip(*sweep), 'o-', label=label)
             refs = [(rpm, level) for rpm, p, level in points if p in (0, 21)]
             if refs:
-                ax.scatter(*zip(*refs), marker='x', color=line.get_color())
+                ax.scatter(*zip(*refs), marker='x', color=line.get_color(), gid=label)
             rows.extend((label, p, rpm, level) for rpm, p, level in points)
         if rows:
             # dataLim includes every waveform's sweep and its stopped references.
@@ -42,7 +42,7 @@ def overlay(reports, folder):
             ax.set(title=title, xlabel='Measured mean speed (RPM)', ylabel='3-axis AC RMS (m/s²)')
             ax.grid(alpha=.25)
             ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
-            fig.savefig(folder / f'{motor}.png', dpi=150)
+            save_figure(fig, folder / f'{motor}.png', figures)
             with (folder / f'{motor}.csv').open('w', encoding='utf-8', newline='') as stream:
                 writer = csv.writer(stream)
                 writer.writerow(['waveform', 'point', 'rpm_mean', 'accel_ac_rms_m_s2'])
@@ -51,13 +51,13 @@ def overlay(reports, folder):
     return f'{len(reports)} 份波形，按实测 RPM 对齐。' + (' 无有效扫速数据：' + '、'.join(missing) if missing else '')
 
 
-def append_reports(existing, paths, workspace):
+def append_reports(existing, paths, workspace, figures=None):
     reports = existing.copy()
     created = []
     try:
         for path in paths:
             try:
-                report, message = analyze(path, workspace)
+                report, message = analyze(path, workspace, figures if not existing and len(paths) == 1 else None)
             except Exception as exc:
                 raise ValueError(f'{path.name}：{exc}') from exc
             created.append(report)
@@ -65,7 +65,7 @@ def append_reports(existing, paths, workspace):
         if len(reports) > 1:
             report = Path(mkdtemp(prefix='rpm_compare_', dir=workspace))
             created.append(report)
-            message = overlay(reports, report)
+            message = overlay(reports, report, figures)
         return (report, reports), message
     except Exception:
         for folder in created:

@@ -8,7 +8,7 @@ from imu_vibration_csv import convert
 from imu_point_stats import generate_report
 
 
-def analyze(path, output):
+def analyze(path, output, figures=None):
     """Create a fresh report; never overwrite previous runs or expose partial results on error."""
     with path.open("rb") as src:
         magic = src.read(4)
@@ -28,7 +28,7 @@ def analyze(path, output):
             outcome = f"转换成功：{count} 条；产测结果：{status}"
             if not count:
                 return folder, outcome + "；无采样可分析"
-        groups, levels = generate_report(csv_path, folder)
+        groups, levels = generate_report(csv_path, folder, figures)
         peak = max(levels, key=levels.get) if levels else None
         detail = (
             f"最大振动：测点 {peak}，{levels[peak]:.4f} m/s²"

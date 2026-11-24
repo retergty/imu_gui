@@ -73,8 +73,8 @@ def write_summary(path, groups):
             writer.writerow([point, source, group.count] + [metrics[m][i] for i in range(3) for m in METRICS])
 
 
-def write_vibration_report(folder, motor, speeds, levels, title):
-    import matplotlib.pyplot as plt
+def write_vibration_report(folder, motor, speeds, levels, title, figures=None):
+    from imu_plot import report_figure, save_figure
 
     rows = [(p, *speeds.get((p, motor), (None,) * 4), levels.get(p))
             for p in sorted(set(levels) | {p for p, m in speeds if m == motor})]
@@ -88,7 +88,8 @@ def write_vibration_report(folder, motor, speeds, levels, title):
     if not any(1 <= r[0] <= 20 and r[1] not in (None, 0) for r in rows):
         image.unlink(missing_ok=True)  # CLI runs may reuse an earlier report directory.
         return False
-    fig, ax = plt.subplots(figsize=(10, 4.5), constrained_layout=True)
+    fig = report_figure((10, 4.5))
+    ax = fig.subplots()
     valid = [r for r in rows if r[1] is not None and r[-1] is not None]
     # Stopped references (0, 21) are not steps in the motor sweep.
     sweep = [r for r in valid if 1 <= r[0] <= 20]
@@ -104,17 +105,17 @@ def write_vibration_report(folder, motor, speeds, levels, title):
     ax.set(title=f'{MOTORS[motor]} | IMU vibration | {title}', xlabel='Measured mean speed (RPM)',
            ylabel='3-axis AC RMS (m/s²)', ylim=(0, None))
     ax.grid(axis='y', alpha=.25)
-    fig.savefig(image, dpi=150)
-    plt.close(fig)
+    save_figure(fig, image, figures)
     return True
 
 
-def plot(path, groups, speeds, motor, title):
-    import matplotlib.pyplot as plt
+def plot(path, groups, speeds, motor, title, figures=None):
+    from imu_plot import report_figure, save_figure
 
     points = sorted((rpm[0], p) for (p, m), rpm in speeds.items() if m == motor and rpm[0] is not None)
     labels = {'mean': 'Mean', 'ac_rms': 'AC RMS (mean removed)'}
-    fig, panels = plt.subplots(2, 2, figsize=(12, 7), constrained_layout=True)
+    fig = report_figure((12, 7))
+    panels = fig.subplots(2, 2)
     for row, (source, sensor, unit) in enumerate(SENSORS):
         stats = {p: g.metrics() for (p, s), g in groups.items() if s == source}
         for panel, metric in zip(panels[row], METRICS):
@@ -122,7 +123,7 @@ def plot(path, groups, speeds, motor, title):
                 sweep = [(rpm, stats[p][metric][i] if p in stats else math.nan) for rpm, p in points if 1 <= p <= 20]
                 line, = panel.plot([x for x, _ in sweep], [y for _, y in sweep], marker=('o', 's', '^')[i], label=axis.upper())
                 refs = [(rpm, stats[p][metric][i]) for rpm, p in points if p in (0, 21) and p in stats]
-                panel.scatter([x for x, _ in refs], [y for _, y in refs], marker='x', color=line.get_color())
+                panel.scatter([x for x, _ in refs], [y for _, y in refs], marker='x', color=line.get_color(), gid=axis.upper())
             panel.set(title=f'{sensor} | {labels[metric]}', xlabel='Measured mean speed (RPM)',
                       ylabel=unit)
             if metric != 'mean':
@@ -133,13 +134,10 @@ def plot(path, groups, speeds, motor, title):
             else:
                 panel.text(.5, .5, 'No samples', transform=panel.transAxes, ha='center')
     fig.suptitle(f'{MOTORS[motor]} | IMU axis statistics — {title}')
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
+    save_figure(fig, path, figures)
 
 
-def generate_report(path, folder):
-    import matplotlib
-    matplotlib.use('Agg')
+def generate_report(path, folder, figures=None):
     table, image = folder / 'summary.csv', folder / 'mean_rms.png'
     motor_files = [folder / f'{m}{suffix}' for m in MOTORS for suffix in ('.csv', '.png', '_mean_rms.png')]
     if path.resolve() in {p.resolve() for p in (table, image, *motor_files)}:
@@ -151,8 +149,8 @@ def generate_report(path, folder):
               for (p, source), group in groups.items() if source == 'accel'}
     for motor in MOTORS:
         axes_image = folder / f'{motor}_mean_rms.png'
-        if write_vibration_report(folder, motor, speeds, levels, path.stem):
-            plot(axes_image, groups, speeds, motor, path.stem)
+        if write_vibration_report(folder, motor, speeds, levels, path.stem, figures):
+            plot(axes_image, groups, speeds, motor, path.stem, figures)
         else:
             axes_image.unlink(missing_ok=True)
     image.unlink(missing_ok=True)  # Remove the superseded point-indexed plot on regeneration.

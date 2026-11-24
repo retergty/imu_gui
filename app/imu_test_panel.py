@@ -26,22 +26,31 @@ class VibrationPanel(QWidget):
         super().__init__()
         self.settings = settings
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel('仅用于固定台架。测试会驱动电机；断开连接不会代替中止。'))
+        layout.setContentsMargins(0, 12, 0, 0)
+        layout.setSpacing(8)
+        warning = QLabel('仅用于固定台架。测试会驱动电机；断开连接不会代替中止。', objectName='benchWarning')
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        layout.addWidget(QLabel('测试配置', objectName='sectionTitle'))
         form = QFormLayout()
+        form.setHorizontalSpacing(24)
         layout.addLayout(form)
         self.mode = QComboBox()
         self.mode.addItems(['主电机', '尾电机', '主尾配对'])
         form.addRow('测试模式', self.mode)
         points = QHBoxLayout()
+        points.setSpacing(8)
         self.first, self.last = QSpinBox(), QSpinBox()
         for spin in (self.first, self.last):
             spin.setRange(1, 20)
-        points.addWidget(self.first)
+        points.addWidget(self.first, 1)
         self.points_separator = QLabel('至')
         points.addWidget(self.points_separator)
-        points.addWidget(self.last)
+        points.addWidget(self.last, 1)
         self.first.valueChanged.connect(self.last.setMinimum)
-        self.points_label = QLabel('连续测点（起止相同即单点）')
+        points.addWidget(QLabel('起止相同即单点', objectName='sectionNote'))
+        points.addStretch(2)
+        self.points_label = QLabel('连续测点')
         form.addRow(self.points_label, points)
         self._point_style = _PointHintStyle()
         self._point_style.setParent(self)
@@ -53,7 +62,7 @@ class VibrationPanel(QWidget):
         self.mode.currentIndexChanged.connect(self.update_point_hints)
         self.update_point_hints()
         self.save = QCheckBox('保存波形到飞控 SD 卡')
-        form.addRow(self.save)
+        form.addRow('波形记录', self.save)
         self.name = QLineEdit(DEFAULT_FILENAME)
         self.name.setPlaceholderText(f'留空使用 {DEFAULT_FILENAME}')
         self.name.setEnabled(False)
@@ -77,7 +86,7 @@ class VibrationPanel(QWidget):
         self.status_timeout = QTimer(self, interval=5000, singleShot=True)
         self.status_timeout.timeout.connect(self.status_unanswered)
         header = QHBoxLayout()
-        self.trim_status = QLabel('舵机调整')
+        self.trim_status = QLabel('舵机调整', objectName='sectionTitle')
         header.addWidget(self.trim_status, 1)
         self.refresh_trim = QPushButton('读取舵机参数')
         header.addWidget(self.refresh_trim)
@@ -93,9 +102,14 @@ class VibrationPanel(QWidget):
         self.trim_timer.timeout.connect(lambda: self.reset_trims('未收到飞控确认，请重新读取'))
         self.refresh_trim.clicked.connect(self.read_trims)
         self.refresh_trim.setEnabled(False)
-        layout.addWidget(QLabel('测试状态（开始后每 10 秒自动查询，也可手动查询）'))
+        status_header = QHBoxLayout()
+        status_header.addWidget(QLabel('测试状态', objectName='sectionTitle'))
+        status_header.addStretch()
+        status_header.addWidget(QLabel('开始后每 10 秒自动查询，也可手动查询', objectName='sectionNote'))
+        layout.addLayout(status_header)
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
+        self.output.setPlaceholderText('连接飞控后，测试状态将在这里显示。')
         self.output.setMaximumBlockCount(2000)
         layout.addWidget(self.output)
 
@@ -145,20 +159,25 @@ class VibrationPanel(QWidget):
             if available and self.isVisible():
                 self.read_trims()
 
+    def append_status(self, message):
+        self.output.appendPlainText(message)
+        scrollbar = self.output.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
     def reset_status_connection(self):
         if self.status_poll.isActive():
-            self.output.appendPlainText('连接已断开，已停止查询；测试是否结束尚未确认。')
+            self.append_status('连接已断开，已停止查询；测试是否结束尚未确认。')
         self.status_poll.stop()
         self.status_timeout.stop()
         self.status_for_test = False
         self.status_stream = StatusStream()
 
     def prepare_module(self):
-        self.output.appendPlainText('已发送产测模块启动指令，可查询状态确认。')
+        self.append_status('已发送产测模块启动指令，可查询状态确认。')
         self.command.emit('factory_test start')
 
     def abort_test(self):
-        self.output.appendPlainText('已发送中止指令，等待飞控确认。')
+        self.append_status('已发送中止指令，等待飞控确认。')
         self.command.emit('factory_test abort')
 
     def query_status(self):
@@ -171,7 +190,7 @@ class VibrationPanel(QWidget):
 
     def status_unanswered(self):
         self.status_for_test = False
-        self.output.appendPlainText('未收到可识别的飞控状态，不能确认测试是否结束。')
+        self.append_status('未收到可识别的飞控状态，不能确认测试是否结束。')
 
     def receive_shell(self, text):
         for kind, payload in self.status_stream.feed(text):
@@ -183,7 +202,7 @@ class VibrationPanel(QWidget):
                 if self.status_for_test and (command != 'motor_vibration' or
                                              state in {'IDLE', 'COMPLETE', 'ABORTED'}):
                     self.status_poll.stop()
-                self.output.appendPlainText(message)
+                self.append_status(message)
             else:
                 self.receive_test_message(payload)
 
@@ -220,7 +239,7 @@ class VibrationPanel(QWidget):
             message = f'振动测试未启动：{reason}。'
             self.status_poll.stop()
         if message:
-            self.output.appendPlainText(message)
+            self.append_status(message)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -276,10 +295,6 @@ class VibrationPanel(QWidget):
             row.addWidget(spin)
             for symbol, hint, step in [('▲', '增加 0.01', spin.stepUp), ('▼', '减少 0.01', spin.stepDown)]:
                 button = QPushButton(symbol)
-                button.setFixedSize(36, 26)
-                font = button.font()
-                font.setPixelSize(14)
-                button.setFont(font)
                 button.setToolTip(hint)
                 button.setAccessibleName(f'{name} {hint}')
                 button.clicked.connect(step)
@@ -323,5 +338,5 @@ class VibrationPanel(QWidget):
             self.remember()
             self.status_for_test = False  # An earlier manual query cannot finish this run.
             self.status_poll.start()
-            self.output.appendPlainText('已发送开始指令，等待飞控确认。')
+            self.append_status('已发送开始指令，等待飞控确认。')
             self.command.emit(cmd)

@@ -7,13 +7,14 @@ from tempfile import TemporaryDirectory
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-from PySide6.QtCore import QEventLoop, QSettings, QTimer
+from PySide6.QtCore import QEventLoop, QPoint, QSettings, Qt, QTimer
+from PySide6.QtTest import QTest
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
-from imu_gui import QApplication, CurvePreview, QPixmap, Window
+from imu_gui import QApplication, CurvePreview, Window
 from imu_shell_transport import send_shell
 from imu_workbench import analyze
 from imu_vibration_download import download_file
@@ -23,13 +24,32 @@ from imu_vibration_download import download_file
 class WorkbenchTests(unittest.TestCase):
     def test_curve_preview_fits_available_width_and_height(self):
         app = QApplication.instance() or QApplication([])
-        preview = CurvePreview(QPixmap(400, 200))
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        fig = Figure(figsize=(4, 2), dpi=100)
+        FigureCanvasAgg(fig).draw()
+        preview = CurvePreview(fig)
         preview.show()
         for width, height, expected in [(1200, 800, (1200, 600)), (700, 200, (400, 200)), (200, 160, (200, 100))]:
             preview.resize(width, height)
             app.processEvents()
             self.assertEqual(preview.pixmap().size().toTuple(), expected)
         preview.close()
+
+    def click_legend(self, preview, ax, entry, swatch=False):
+        legend = ax.get_legend()
+        text = legend.get_texts()[entry]
+        renderer = preview.figure.canvas.get_renderer()
+        box = text.get_window_extent(renderer)
+        x = (box.x0 + box.x1) / 2
+        if swatch:
+            x = box.x0 - renderer.points_to_pixels(text.get_fontsize()) * (legend.handletextpad + legend.handlelength / 2)
+        size = preview.pixmap().size()
+        y = (box.y0 + box.y1) / 2
+        point = QPoint(round((preview.width() - size.width()) / 2 + x * size.width() / preview.original.width()),
+                       round((preview.height() - size.height()) / 2 + size.height() * (1 - y / preview.original.height())))
+        QTest.mouseClick(preview, Qt.MouseButton.LeftButton, pos=point)
 
     def test_menu_order_and_old_selection(self):
         app = QApplication.instance() or QApplication([])
@@ -81,10 +101,10 @@ class WorkbenchTests(unittest.TestCase):
                 with path.open('w', newline='') as stream:
                     out = csv.writer(stream)
                     out.writerow('source point x y z rpm_mean rpm_min rpm_max rpm_count'.split())
-                    for p, rpm in [(2, 2000 + rpm_offset), (3, 1500)]:
+                    for p, rpm in [(0, 0), (2, 2000 + rpm_offset), (3, 1500)]:
                         for x in [-1, 1]:
-                            out.writerow(['accel', p + shift, x, 0, 0, '', '', '', ''])
-                        out.writerow(['main_rpm', p + shift, '', '', '', rpm, rpm, rpm, 1])
+                            out.writerow(['accel', p + shift if p else 0, x, 0, 0, '', '', '', ''])
+                        out.writerow(['main_rpm', p + shift if p else 0, '', '', '', rpm, rpm, rpm, 1])
             prefs = QSettings(str(root / 'prefs.ini'), QSettings.Format.IniFormat)
             prefs.setValue('ui/tabName', '本地分析')
             w = Window(prefs)
@@ -98,16 +118,37 @@ class WorkbenchTests(unittest.TestCase):
                     QTimer.singleShot(30000, loop.quit)
                     loop.exec()
                     app.processEvents()
+            w.show()
             append(paths[:1])
+            w.views.setCurrentIndex(1)
+            axes_preview = w.views.currentWidget()
+            ax, other = axes_preview.figure.axes[:2]
+            self.click_legend(axes_preview, ax, 1)
+            self.assertEqual([line.get_visible() for line in ax.lines], [True, False, True])
+            self.assertFalse(ax.collections[1].get_visible())
+            self.assertTrue(other.lines[1].get_visible())
+            self.click_legend(axes_preview, ax, 1, swatch=True)
+            self.assertTrue(ax.collections[1].get_visible())
+            self.assertTrue(ax.lines[1].get_visible())
             append(paths)
             append(paths)
             self.assertEqual(list(w.waveforms), paths)
             self.assertEqual(w.views.tabText(0), '主电机曲线', w.info.text())
-            self.assertFalse(w.views.widget(0).original.isNull())
+            w.views.setCurrentIndex(0)
+            preview = w.views.currentWidget()
+            ax = preview.figure.axes[0]
+            limits = ax.get_xlim(), ax.get_ylim()
+            original_png = (w.report / 'main_rpm.png').read_bytes()
+            self.click_legend(preview, ax, 0, swatch=True)
+            self.assertFalse(ax.lines[0].get_visible())
+            self.assertFalse(ax.collections[0].get_visible())
+            self.assertTrue(ax.lines[1].get_visible())
+            self.assertTrue(ax.collections[1].get_visible())
+            self.assertEqual(limits, (ax.get_xlim(), ax.get_ylim()))
             with (w.report / 'main_rpm.csv').open() as stream:
                 rows = list(csv.DictReader(stream))
-            self.assertEqual([float(r['rpm_mean']) for r in rows], [1500, 2000, 1500, 2300])
-            self.assertEqual([int(r['point']) for r in rows], [3, 2, 4, 3])
+            self.assertEqual([float(r['rpm_mean']) for r in rows], [0, 1500, 2000, 0, 1500, 2300])
+            self.assertEqual([int(r['point']) for r in rows], [0, 3, 2, 0, 4, 3])
             old = w.report
             append([root / 'missing.csv'])
             self.assertEqual(w.report, old)
@@ -118,7 +159,7 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(w.views.count(), 0)
             self.assertFalse(w.waveforms)
             self.assertFalse(old.exists())
-            self.assertTrue((saved / 'main_rpm.png').is_file())
+            self.assertEqual((saved / 'main_rpm.png').read_bytes(), original_png)
             self.assertTrue(all(p.exists() for p in paths))
             w.close()
 

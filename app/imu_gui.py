@@ -8,7 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
 
 from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QPixmap, QTextCursor
+from PySide6.QtGui import QDesktopServices, QImage, QPixmap, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 from serial.tools.list_ports import comports
 from imu_compare import append_reports
 from imu_test_panel import VibrationPanel
+from imu_theme import apply_theme
 from imu_workers import Analysis, Connection
 
 
@@ -45,18 +46,65 @@ def button(layout, title, callback):
 
 
 class CurvePreview(QLabel):
-    def __init__(self, original):
+    def __init__(self, figure):
         super().__init__()
-        self.original = original
+        self.figure = figure
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        self.setToolTip('点击图例可隐藏或恢复对应曲线，仅影响当前预览。')
+        self.refresh_image()
+
+    def refresh_image(self):
+        canvas = self.figure.canvas
+        rgba = canvas.buffer_rgba()  # Already drawn when the report PNG was saved.
+        h, w, _ = rgba.shape
+        self.original = QPixmap.fromImage(QImage(rgba, w, h, 4 * w, QImage.Format.Format_RGBA8888))
+        self.fit_image()
+
+    def fit_image(self):
+        size = self.contentsRect().size()
+        if not size.isEmpty():
+            self.setPixmap(self.original.scaled(size, Qt.AspectRatioMode.KeepAspectRatio,
+                                               Qt.TransformationMode.SmoothTransformation))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        size = self.contentsRect().size()
-        if not size.isEmpty() and not self.original.isNull():
-            self.setPixmap(self.original.scaled(size, Qt.AspectRatioMode.KeepAspectRatio,
-                                               Qt.TransformationMode.SmoothTransformation))
+        self.fit_image()
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton or self.pixmap().isNull():
+            return super().mousePressEvent(event)
+        # The centered preview may be letterboxed. Convert Qt coordinates (top left)
+        # to the Agg renderer's coordinates (bottom left) before testing the legend.
+        size = self.pixmap().size()
+        rect = self.contentsRect()
+        left = rect.x() + (rect.width() - size.width()) / 2
+        top = rect.y() + (rect.height() - size.height()) / 2
+        x = (event.position().x() - left) * self.original.width() / size.width()
+        y = (1 - (event.position().y() - top) / size.height()) * self.original.height()
+        renderer = self.figure.canvas.get_renderer()
+        for ax in self.figure.axes:
+            legend = ax.get_legend()
+            if legend is None:
+                continue
+            for text, handle in zip(legend.get_texts(), legend.legend_handles):
+                box = text.get_window_extent(renderer)
+                # Include the swatch and the gap before its label (also for scatter handles).
+                swatch = renderer.points_to_pixels(text.get_fontsize()) * (legend.handlelength + legend.handletextpad)
+                if box.x0 - swatch <= x <= box.x1 and box.y0 <= y <= box.y1:
+                    label = text.get_text()
+                    artists = [a for a in (*ax.lines, *ax.collections)
+                               if a.get_label() == label or a.get_gid() == label]
+                    if artists:
+                        visible = not artists[0].get_visible()
+                        for artist in artists:
+                            artist.set_visible(visible)
+                        for item in (handle, text):
+                            item.set_alpha(1 if visible else .35)
+                        self.figure.canvas.draw()
+                        self.refresh_image()
+                    return
+        super().mousePressEvent(event)
 
 
 class Window(QMainWindow):
@@ -64,14 +112,26 @@ class Window(QMainWindow):
         super().__init__()
         self.settings = settings if settings is not None else QSettings("IMUWorkbench", "Desktop")
         self.setWindowTitle("飞控 IMU 工作台")
-        self.resize(980, 680)
+        self.resize(1000, 700)
         self.link = self.analysis = self.report = None
         self.waveforms = {}
         self.preview = self.saved_report = None
         self.online = self.busy = False
-        root = QWidget()
+        root = QWidget(objectName="workbench")
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
+        layout.setContentsMargins(24, 16, 24, 16)
+        layout.setSpacing(9)
+        heading = QHBoxLayout()
+        title = QLabel(self.windowTitle())
+        title_font = title.font()
+        title_font.setPointSizeF(title_font.pointSizeF() + 6)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        heading.addWidget(title, 1)
+        self.state = QLabel(objectName="connectionState")
+        heading.addWidget(self.state)
+        layout.addLayout(heading)
         bar = QHBoxLayout()
         layout.addLayout(bar)
         bar.addWidget(QLabel("端口 / MAVLink 地址"))
@@ -82,10 +142,10 @@ class Window(QMainWindow):
         self.baud = QComboBox()
         self.baud.addItems(["115200", "57600", "230400", "460800", "921600"])
         self.baud.setEditable(True)
+        bar.addWidget(QLabel("波特率"))
         bar.addWidget(self.baud)
         self.connect_btn = button(bar, "连接", self.connect_device)
-        self.state = QLabel()
-        bar.addWidget(self.state)
+        self.connect_btn.setObjectName("connectButton")
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
         self.vibration = VibrationPanel(self.settings)
@@ -332,14 +392,14 @@ class Window(QMainWindow):
         self.run_task(Analysis(self.waveforms, paths, Path(self.preview.name), operation=append_reports),
                       self.append_done, f'正在追加 {len(paths)} 份波形…')
 
-    def append_done(self, result, message):
+    def append_done(self, result, message, figures):
         folder, reports = result
         if self.report and self.report not in self.waveforms.values() and self.preview and self.report.parent == Path(self.preview.name):
             shutil.rmtree(self.report, ignore_errors=True)
         self.waveforms = reports
         self.source = next(iter(reports))
         self.saved_report = None
-        self.show_report(folder, message)
+        self.show_report(folder, message, figures)
 
     def clear_views(self):
         while self.views.count():
@@ -391,10 +451,10 @@ class Window(QMainWindow):
         self.source = path
         self.run_task(Analysis(path, folder), self.download_report, f'正在处理：{path}')
 
-    def download_report(self, folder, message):
+    def download_report(self, folder, message, figures):
         self.waveforms = {self.source.resolve(): folder}
         self.saved_report = folder
-        self.show_report(folder, message)
+        self.show_report(folder, message, figures)
 
     def run_task(self, task, on_result, message):
         self.remember_view()
@@ -415,7 +475,7 @@ class Window(QMainWindow):
         self.analysis = None
         self.controls()
 
-    def show_report(self, folder, message):
+    def show_report(self, folder, message, figures):
         self.report = folder
         self.report_message = message
         self.clear_views()
@@ -426,8 +486,8 @@ class Window(QMainWindow):
             ("main_rpm_mean_rms.png", "主电机分轴统计"),
             ("tail_rpm_mean_rms.png", "尾电机分轴统计"),
         ]:
-            if (folder / filename).exists():
-                self.views.addTab(CurvePreview(QPixmap(str(folder / filename))), title)
+            if filename in figures:
+                self.views.addTab(CurvePreview(figures[filename]), title)
         for filename, title in [("main_rpm.csv", "主电机表"), ("tail_rpm.csv", "尾电机表"), ("summary.csv", "分轴统计表")]:
             if not (folder / filename).exists():
                 continue
@@ -474,6 +534,7 @@ class Window(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    apply_theme(app)
     window = Window()
     window.show()
     if "--smoke-test" in sys.argv:
