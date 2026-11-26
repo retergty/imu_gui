@@ -155,7 +155,8 @@ class WorkbenchTests(unittest.TestCase):
             self.assertEqual(rows['2', 'gyro']['z_mean_minus_baseline'], '')
             append(paths)
             append(paths)
-            self.assertEqual(list(w.analysis.waveforms), paths)
+            # Windows TEMP may contain an 8.3 alias; the GUI stores resolved paths.
+            self.assertEqual(list(w.analysis.waveforms), [p.resolve() for p in paths])
             self.assertEqual(w.analysis.views.tabText(0), '主电机曲线', w.analysis.info.text())
             for tab, (axis, deltas) in enumerate(zip('XYZ', ([3, 2], [-3, -2], [6, 4])), 1):
                 self.assertEqual(w.analysis.views.tabText(tab), f'主电机 {axis} 轴统计')
