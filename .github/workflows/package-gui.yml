@@ -38,6 +38,11 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-icccm4 \
             libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+      - name: Run regression tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: '1'
+        run: ${{ matrix.interpreter }} -m unittest discover -s tests -v
       - name: Build and smoke-test GUI
         run: |
           if ! "${{ matrix.interpreter }}" tools/build_gui.py > build-gui.log 2>&1; then

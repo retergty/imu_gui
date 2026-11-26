@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
 """List and download factory IMU waveforms over MAVFTP."""
 import argparse
 import errno
 import logging
-from pathlib import Path
 import sys
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic
 
@@ -26,12 +25,18 @@ def show_progress(percent, received, elapsed):
     print(f'\r下载进度 [{bar}] {percent:3d}%  平均 {speed:6.1f} kB/s', end='', file=sys.stderr, flush=True)
 
 
+def valid_filename(name):
+    return bool(name) and name not in ('.', '..') and not any(c in name for c in '/\\:\0')
+
+
 def list_files(ftp):
     check(ftp.cmd_list([REMOTE_DIR]))
-    return sorted((e for e in ftp.list_result if not e.is_dir), key=lambda e: e.name)
+    return sorted((e for e in ftp.list_result if not e.is_dir and valid_filename(e.name)), key=lambda e: e.name)
 
 
 def download_file(ftp, entry, destination, progress=show_progress):
+    if not valid_filename(entry.name):
+        raise ValueError('远端条目不是有效文件名')
     output = destination.parent
     output.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=output) as staging:
@@ -72,9 +77,6 @@ def browse(ftp, output):
         print(f'请输入 1 到 {len(files)} 之间的编号。')
 
     entry = files[int(choice) - 1]
-    if not entry.name or Path(entry.name).name != entry.name or entry.name in ('.', '..'):
-        raise ValueError('远端条目不是有效文件名')
-    output.mkdir(parents=True, exist_ok=True)
     destination = output / entry.name
     if destination.exists() and input(f'{destination} 已存在，覆盖？[y/N] ').strip().lower() != 'y':
         return

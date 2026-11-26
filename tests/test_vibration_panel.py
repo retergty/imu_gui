@@ -6,10 +6,10 @@ from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'app'))
+from imu_test_panel import VibrationPanel
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
-from imu_test_panel import VibrationPanel
 
 
 class PanelTests(unittest.TestCase):

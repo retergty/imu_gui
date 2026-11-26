@@ -1,12 +1,12 @@
-from queue import Queue, Empty
 import struct
+from queue import Empty, Queue
 from time import monotonic
 
-from PySide6.QtCore import QThread, Signal
-from pymavlink import mavftp, mavutil
+from imu_shell_transport import send_shell, shell_payload
 from imu_vibration_download import download_file, list_files
 from imu_workbench import analyze
-from imu_shell_transport import send_shell
+from pymavlink import mavftp, mavutil
+from PySide6.QtCore import QThread, Signal
 
 
 class Analysis(QThread):
@@ -22,7 +22,7 @@ class Analysis(QThread):
         try:
             figures = {}
             self.result.emit(*self.operation(*self.args, figures=figures), figures)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - relay worker failures to the UI thread
             self.error.emit(str(exc))
 
 
@@ -88,30 +88,8 @@ class Connection(QThread):
                     finally:
                         last_rx = monotonic()
                         self.idle.emit()
-                for _ in range(100):
-                    msg = link.recv_match(blocking=False)
-                    if msg is None:
-                        break
-                    if msg.get_srcSystem() != link.target_system:
-                        continue
-                    if msg.get_type() == "HEARTBEAT":
-                        last_rx = monotonic()
-                    elif msg.get_type() == 'PARAM_VALUE' and msg.get_srcComponent() == param_component:
-                        value = msg.param_value
-                        if msg.param_id == 'CA_SP0_COUNT' and msg.param_type == mavutil.mavlink.MAV_PARAM_TYPE_INT32:
-                            # PX4 transports integer parameters bytewise inside the float field.
-                            value, = struct.unpack('<i', struct.pack('<f', value))
-                        elif msg.param_type != mavutil.mavlink.MAV_PARAM_TYPE_REAL32:
-                            continue
-                        self.parameter.emit(msg.param_id, value)
-                    elif (
-                        msg.get_type() == "SERIAL_CONTROL"
-                        and msg.device == 10
-                        and msg.count
-                    ):
-                        self.output.emit(
-                            bytes(msg.data[: msg.count]).decode("utf-8", "replace")
-                        )
+                if self.receive_messages(link, param_component):
+                    last_rx = monotonic()
                 if monotonic() - last_rx > 12:
                     raise OSError("心跳超时，连接已关闭。")
                 if monotonic() >= next_ping:
@@ -123,7 +101,7 @@ class Connection(QThread):
                         0,
                     )
                     next_ping = monotonic() + 1
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - relay worker failures to the UI thread
             self.error.emit(str(exc))
         finally:
             if link is not None:
@@ -132,3 +110,26 @@ class Connection(QThread):
                         send_shell(link, b"")
                 finally:
                     link.close()
+
+    def receive_messages(self, link, param_component):
+        """Drain a bounded batch without starving queued jobs or heartbeat checks."""
+        heartbeat_received = False
+        for _ in range(100):
+            msg = link.recv_match(blocking=False)
+            if msg is None:
+                break
+            if msg.get_srcSystem() != link.target_system:
+                continue
+            if msg.get_type() == "HEARTBEAT":
+                heartbeat_received = True
+            elif msg.get_type() == 'PARAM_VALUE' and msg.get_srcComponent() == param_component:
+                value = msg.param_value
+                if msg.param_id == 'CA_SP0_COUNT' and msg.param_type == mavutil.mavlink.MAV_PARAM_TYPE_INT32:
+                    # PX4 transports integer parameters bytewise inside the float field.
+                    value, = struct.unpack('<i', struct.pack('<f', value))
+                elif msg.param_type != mavutil.mavlink.MAV_PARAM_TYPE_REAL32:
+                    continue
+                self.parameter.emit(msg.param_id, value)
+            elif msg.get_type() == 'SERIAL_CONTROL' and (data := shell_payload(msg)):
+                self.output.emit(data.decode('utf-8', 'replace'))
+        return heartbeat_received

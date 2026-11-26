@@ -1,29 +1,44 @@
 import csv
 import os
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+import sys
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 from PySide6.QtCore import QEventLoop, QPoint, QSettings, Qt, QTimer
 from PySide6.QtTest import QTest
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
-from imu_gui import QApplication, CurvePreview, Window
+from imu_analysis_panel import CurvePreview
+from imu_gui import Window
 from imu_shell_transport import send_shell
-from imu_workbench import analyze
+from imu_ui import last_dir
 from imu_vibration_download import download_file
-
+from imu_workbench import analyze
+from PySide6.QtWidgets import QApplication
 
 
 class WorkbenchTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def wait_for_analysis(self, panel):
+        if panel.task is not None:
+            loop = QEventLoop()
+            panel.task.finished.connect(loop.quit)
+            QTimer.singleShot(30000, loop, loop.quit)
+            loop.exec()
+            self.app.processEvents()
+        self.assertIsNone(panel.task, panel.info.text())
+
     def test_curve_preview_fits_available_width_and_height(self):
-        app = QApplication.instance() or QApplication([])
         from matplotlib.backends.backend_agg import FigureCanvasAgg
         from matplotlib.figure import Figure
 
@@ -33,7 +48,7 @@ class WorkbenchTests(unittest.TestCase):
         preview.show()
         for width, height, expected in [(1200, 800, (1200, 600)), (700, 200, (400, 200)), (200, 160, (200, 100))]:
             preview.resize(width, height)
-            app.processEvents()
+            self.app.processEvents()
             self.assertEqual(preview.pixmap().size().toTuple(), expected)
         preview.close()
 
@@ -52,7 +67,6 @@ class WorkbenchTests(unittest.TestCase):
         QTest.mouseClick(preview, Qt.MouseButton.LeftButton, pos=point)
 
     def test_menu_order_and_old_selection(self):
-        app = QApplication.instance() or QApplication([])
         with TemporaryDirectory() as d:
             prefs = QSettings(str(Path(d) / 'prefs.ini'), QSettings.Format.IniFormat)
             w = Window(prefs)
@@ -92,7 +106,6 @@ class WorkbenchTests(unittest.TestCase):
                 self.assertGreater(ax.get_ylim()[1], [2, 30, 45][i])
 
     def test_compare_waveforms_in_gui(self):
-        app = QApplication.instance() or QApplication([])
         with TemporaryDirectory() as d:
             root = Path(d)
             paths = [root / 'first.csv', root / 'second.csv']
@@ -100,108 +113,126 @@ class WorkbenchTests(unittest.TestCase):
                 shift, rpm_offset = offsets
                 with path.open('w', newline='') as stream:
                     out = csv.writer(stream)
-                    out.writerow('source point x y z rpm_mean rpm_min rpm_max rpm_count'.split())
+                    out.writerow(['source', 'point', 'x', 'y', 'z', 'rpm_mean', 'rpm_min', 'rpm_max', 'rpm_count'])
                     for p, rpm in [(0, 0), (2, 2000 + rpm_offset), (3, 1500)]:
                         for x in [-1, 1]:
-                            out.writerow(['accel', p + shift if p else 0, x, 0, 0, '', '', '', ''])
+                            out.writerow(['accel', p + shift if p else 0, 10 + 50 * shift + p + x, 20 - p + x, 30 + 2*p + x, '', '', '', ''])
+                            if p or shift:  # Only the second waveform has a gyro baseline.
+                                out.writerow(['gyro', p + shift if p else 0, x, x, x, '', '', '', ''])
                         out.writerow(['main_rpm', p + shift if p else 0, '', '', '', rpm, rpm, rpm, 1])
             prefs = QSettings(str(root / 'prefs.ini'), QSettings.Format.IniFormat)
             prefs.setValue('ui/tabName', '本地分析')
             w = Window(prefs)
             self.assertEqual(w.tabs.tabText(w.tabs.currentIndex()), '数据分析')
             def append(files):
-                with patch('imu_gui.QFileDialog.getOpenFileNames', return_value=(list(map(str, files)), '')):
-                    w.choose.click()
-                if w.analysis:
-                    loop = QEventLoop()
-                    w.analysis.finished.connect(loop.quit)
-                    QTimer.singleShot(30000, loop.quit)
-                    loop.exec()
-                    app.processEvents()
+                with patch('imu_analysis_panel.QFileDialog.getOpenFileNames', return_value=(list(map(str, files)), '')):
+                    w.analysis.choose.click()
+                self.wait_for_analysis(w.analysis)
             w.show()
             append(paths[:1])
-            w.views.setCurrentIndex(1)
-            axes_preview = w.views.currentWidget()
-            ax, other = axes_preview.figure.axes[:2]
-            self.click_legend(axes_preview, ax, 1)
-            self.assertEqual([line.get_visible() for line in ax.lines], [True, False, True])
-            self.assertFalse(ax.collections[1].get_visible())
-            self.assertTrue(other.lines[1].get_visible())
-            self.click_legend(axes_preview, ax, 1, swatch=True)
-            self.assertTrue(ax.collections[1].get_visible())
-            self.assertTrue(ax.lines[1].get_visible())
+            for tab, (axis, deltas) in enumerate(zip('XYZ', ([3, 2], [-3, -2], [6, 4])), 1):
+                self.assertEqual(w.analysis.views.tabText(tab), f'主电机 {axis} 轴统计')
+                w.analysis.views.setCurrentIndex(tab)
+                preview = w.analysis.views.currentWidget()
+                mean, rms, gyro_mean, gyro_rms = preview.figure.axes
+                self.assertEqual([line.get_label() for line in mean.lines], [axis])
+                self.assertEqual(list(mean.lines[0].get_ydata()), deltas)
+                self.assertEqual(list(mean.collections[0].get_offsets()[:, 1]), [0])
+                self.assertEqual(list(rms.lines[0].get_ydata()), [1, 1])
+                self.assertFalse(gyro_mean.lines)
+                self.assertIn('No baseline', gyro_mean.texts[0].get_text())
+                self.assertEqual(list(gyro_rms.lines[0].get_ydata()), [1, 1])
+            self.click_legend(preview, mean, 0)
+            self.assertFalse(mean.lines[0].get_visible())
+            self.assertFalse(mean.collections[0].get_visible())
+            self.assertTrue(rms.lines[0].get_visible())
+            self.click_legend(preview, mean, 0, swatch=True)
+            self.assertTrue(mean.collections[0].get_visible())
+            with (w.analysis.report / 'summary.csv').open() as stream:
+                rows = {(r['point'], r['source']): r for r in csv.DictReader(stream)}
+            self.assertEqual(float(rows['2', 'accel']['z_mean']), 34)
+            self.assertEqual(float(rows['2', 'accel']['z_mean_minus_baseline']), 4)
+            self.assertEqual(rows['2', 'gyro']['z_mean_minus_baseline'], '')
             append(paths)
             append(paths)
-            self.assertEqual(list(w.waveforms), paths)
-            self.assertEqual(w.views.tabText(0), '主电机曲线', w.info.text())
-            w.views.setCurrentIndex(0)
-            preview = w.views.currentWidget()
+            self.assertEqual(list(w.analysis.waveforms), paths)
+            self.assertEqual(w.analysis.views.tabText(0), '主电机曲线', w.analysis.info.text())
+            for tab, (axis, deltas) in enumerate(zip('XYZ', ([3, 2], [-3, -2], [6, 4])), 1):
+                self.assertEqual(w.analysis.views.tabText(tab), f'主电机 {axis} 轴统计')
+                mean, rms, gyro_mean, gyro_rms = w.analysis.views.widget(tab).figure.axes
+                self.assertEqual([line.get_label() for line in mean.lines], ['1. first.csv', '2. second.csv'])
+                self.assertEqual([list(line.get_xdata()) for line in mean.lines], [[1500, 2000], [1500, 2300]])
+                self.assertEqual([list(line.get_ydata()) for line in mean.lines], [deltas, deltas])
+                self.assertEqual([line.get_label() for line in gyro_mean.lines], ['2. second.csv'])
+                self.assertEqual(len(gyro_rms.lines), 2)
+            with (w.analysis.report / 'summary.csv').open() as stream:
+                self.assertEqual({r['waveform'] for r in csv.DictReader(stream)}, {'1. first.csv', '2. second.csv'})
+            w.analysis.views.setCurrentIndex(0)
+            preview = w.analysis.views.currentWidget()
             ax = preview.figure.axes[0]
             limits = ax.get_xlim(), ax.get_ylim()
-            original_png = (w.report / 'main_rpm.png').read_bytes()
+            original_png = (w.analysis.report / 'main_rpm.png').read_bytes()
             self.click_legend(preview, ax, 0, swatch=True)
             self.assertFalse(ax.lines[0].get_visible())
             self.assertFalse(ax.collections[0].get_visible())
             self.assertTrue(ax.lines[1].get_visible())
             self.assertTrue(ax.collections[1].get_visible())
             self.assertEqual(limits, (ax.get_xlim(), ax.get_ylim()))
-            with (w.report / 'main_rpm.csv').open() as stream:
+            with (w.analysis.report / 'main_rpm.csv').open() as stream:
                 rows = list(csv.DictReader(stream))
             self.assertEqual([float(r['rpm_mean']) for r in rows], [0, 1500, 2000, 0, 1500, 2300])
             self.assertEqual([int(r['point']) for r in rows], [0, 3, 2, 0, 4, 3])
-            old = w.report
+            old = w.analysis.report
             append([root / 'missing.csv'])
-            self.assertEqual(w.report, old)
-            with patch('imu_gui.QFileDialog.getExistingDirectory', return_value=d):
-                w.save_report()
-            saved = w.saved_report
-            w.clear_btn.click()
-            self.assertEqual(w.views.count(), 0)
-            self.assertFalse(w.waveforms)
+            self.assertEqual(w.analysis.report, old)
+            with patch('imu_analysis_panel.QFileDialog.getExistingDirectory', return_value=d):
+                w.analysis.save_report()
+            saved = w.analysis.saved_report
+            w.analysis.clear_btn.click()
+            self.assertEqual(w.analysis.views.count(), 0)
+            self.assertFalse(w.analysis.waveforms)
             self.assertFalse(old.exists())
             self.assertEqual((saved / 'main_rpm.png').read_bytes(), original_png)
+            for axis in 'xyz':
+                self.assertTrue((saved / f'main_rpm_{axis}_mean_rms.png').is_file())
             self.assertTrue(all(p.exists() for p in paths))
             w.close()
 
     def test_existing_waveform_in_gui(self):
-        app = QApplication.instance() or QApplication([])
         with TemporaryDirectory() as d:
             w = Window(QSettings(str(Path(d) / "prefs.ini"), QSettings.Format.IniFormat))
-            with patch('imu_gui.QFileDialog.getOpenFileNames', return_value=([str(ROOT / 'logs/raw/imu01.bin')], '')), \
-                 patch('imu_gui.QFileDialog.getExistingDirectory') as select_dir:
-                w.open_local()
+            with patch('imu_analysis_panel.QFileDialog.getOpenFileNames', return_value=([str(ROOT / 'examples/rpm_compare/A_mid.bin')], '')), \
+                 patch('imu_analysis_panel.QFileDialog.getExistingDirectory') as select_dir:
+                w.analysis.open_local()
                 select_dir.assert_not_called()
-            loop = QEventLoop()
-            w.analysis.finished.connect(loop.quit)
-            QTimer.singleShot(30000, loop.quit)
-            loop.exec()
-            app.processEvents()
-            self.assertIsNone(w.analysis)
-            self.assertEqual(w.views.count(), 5, w.info.text())
-            self.assertTrue((w.report / "main_rpm_mean_rms.png").is_file())
-            self.assertFalse((w.report / "mean_rms.png").exists())
-            self.assertFalse((w.report / "tail_rpm_mean_rms.png").exists())
-            self.assertTrue((w.report / 'main_rpm.png').is_file())
-            self.assertFalse((w.report / 'tail_rpm.png').exists())
+            self.wait_for_analysis(w.analysis)
+            self.assertEqual(w.analysis.views.count(), 7, w.analysis.info.text())
+            for axis in "xyz":
+                self.assertTrue((w.analysis.report / f"main_rpm_{axis}_mean_rms.png").is_file())
+            self.assertFalse((w.analysis.report / "main_rpm_mean_rms.png").exists())
+            self.assertFalse((w.analysis.report / "mean_rms.png").exists())
+            self.assertFalse((w.analysis.report / "tail_rpm_mean_rms.png").exists())
+            self.assertTrue((w.analysis.report / 'main_rpm.png').is_file())
+            self.assertFalse((w.analysis.report / 'tail_rpm.png').exists())
             expected = {}
-            with (w.report / 'samples.csv').open() as stream:
+            with (w.analysis.report / 'samples.csv').open() as stream:
                 for r in csv.DictReader(stream):
                     if r['source'] in ('main_rpm', 'tail_rpm'):
                         expected[r['source'], r['point']] = r['rpm_mean']
             for motor in ('main_rpm', 'tail_rpm'):
-                with (w.report / f'{motor}.csv').open() as stream:
+                with (w.analysis.report / f'{motor}.csv').open() as stream:
                     rows = list(csv.DictReader(stream))
-                self.assertEqual(len(rows), 20)
+                self.assertEqual(len(rows), 4)
                 rpms = [float(r['rpm_mean']) for r in rows if r['rpm_mean']]
                 self.assertEqual(rpms, sorted(rpms))
                 for r in rows:
-                    self.assertEqual(r['rpm_mean'], expected[motor, r['point']])
+                    self.assertEqual(r['rpm_mean'], expected.get((motor, r['point']), ''))
                     self.assertGreater(float(r['accel_ac_rms_m_s2']), 0)
-            preview = w.report
-            self.assertFalse(w.open_report.isEnabled())
-            with patch('imu_gui.QFileDialog.getExistingDirectory', return_value=d):
-                w.save_report_btn.click()
-            saved = w.saved_report
+            preview = w.analysis.report
+            self.assertFalse(w.analysis.open_report.isEnabled())
+            with patch('imu_analysis_panel.QFileDialog.getExistingDirectory', return_value=d):
+                w.analysis.save_report_btn.click()
+            saved = w.analysis.saved_report
             self.assertEqual(saved.parent, Path(d))
             self.assertEqual((saved / 'summary.csv').read_bytes(), (preview / 'summary.csv').read_bytes())
             w.auto.setChecked(True)
@@ -211,12 +242,11 @@ class WorkbenchTests(unittest.TestCase):
             restored = Window(QSettings(str(Path(d) / 'prefs.ini'), QSettings.Format.IniFormat))
             self.assertEqual(restored.tabs.currentIndex(), 2)
             self.assertTrue(restored.auto.isChecked())
-            self.assertEqual(restored.last_dir('analysis/saveDir'), Path(d))
-            self.assertEqual(restored.last_dir('analysis/openDir'), ROOT / 'logs/raw')
+            self.assertEqual(last_dir(restored.settings, 'analysis/saveDir'), Path(d))
+            self.assertEqual(last_dir(restored.settings, 'analysis/openDir'), ROOT / 'examples/rpm_compare')
             restored.close()
 
     def test_restore_connection_without_opening_port(self):
-        app = QApplication.instance() or QApplication([])
         with TemporaryDirectory() as d:
             path = str(Path(d) / "prefs.ini")
             w = Window(QSettings(path, QSettings.Format.IniFormat))
@@ -230,7 +260,6 @@ class WorkbenchTests(unittest.TestCase):
             restored.close()
 
     def test_restore_vibration_choices_without_starting(self):
-        app = QApplication.instance() or QApplication([])
         with TemporaryDirectory() as d:
             path = str(Path(d) / "prefs.ini")
             w = Window(QSettings(path, QSettings.Format.IniFormat))

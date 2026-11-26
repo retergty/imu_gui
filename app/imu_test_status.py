@@ -2,7 +2,6 @@
 
 import re
 
-
 STATES = {
     'IDLE': '空闲', 'PRECHECK': '正在进行启动检查', 'RUNNING': '测试进行中',
     'COMPLETE': '测试已完成', 'ABORTED': '测试已中止',

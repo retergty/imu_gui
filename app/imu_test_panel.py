@@ -1,12 +1,26 @@
 """Controls for the firmware's fixed-bench motor_vibration test."""
 import re
 
-from PySide6.QtCore import Signal, QTimer, QSignalBlocker, Qt
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QDoubleSpinBox,
-    QProxyStyle, QStyle, QVBoxLayout, QWidget)
 from imu_test_status import REASONS, StatusStream, describe_status
-
+from imu_ui import button
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QPlainTextEdit,
+    QProxyStyle,
+    QPushButton,
+    QSpinBox,
+    QStyle,
+    QVBoxLayout,
+    QWidget,
+)
 
 DEFAULT_FILENAME = "imu_raw.bin"
 
@@ -70,15 +84,10 @@ class VibrationPanel(QWidget):
         form.addRow('文件名', self.name)
         actions = QHBoxLayout()
         layout.addLayout(actions)
-        def add(text, callback):
-            btn = QPushButton(text)
-            actions.addWidget(btn)
-            btn.clicked.connect(callback)
-            return btn
-        self.prepare = add('启动产测模块', self.prepare_module)
-        self.begin = add('开始振动测试…', self.start_test)
-        self.status = add('查询状态', self.query_status)
-        self.abort = add('中止测试', self.abort_test)
+        self.prepare = button(actions, '启动产测模块', self.prepare_module)
+        self.begin = button(actions, '开始振动测试…', self.start_test)
+        self.status = button(actions, '查询状态', self.query_status)
+        self.abort = button(actions, '中止测试', self.abort_test)
         self.status_stream = StatusStream()
         self.status_for_test = False
         self.status_poll = QTimer(self, interval=10000, timerType=Qt.TimerType.PreciseTimer)
