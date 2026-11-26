@@ -5,17 +5,19 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from imu_compare import append_reports
+from imu_fft import fft_curves, render_fft
+from imu_plot_view import CurvePreview
 from imu_point_stats import AXIS_PLOTS
 from imu_ui import button, last_dir, restore_tab
 from imu_workbench import copy_report
 from imu_workers import Analysis
-from PySide6.QtCore import Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QImage, QPixmap
+from PySide6.QtCore import QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
-    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -24,66 +26,61 @@ from PySide6.QtWidgets import (
 )
 
 
-class CurvePreview(QLabel):
-    def __init__(self, figure):
+class FFTView(QWidget):
+    def __init__(self, waveforms, calculate):
         super().__init__()
-        self.figure = figure
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        self.setToolTip('点击图例可隐藏或恢复对应曲线，仅影响当前预览。')
-        self.refresh_image()
+        self.curves = fft_curves(waveforms)
+        self.preview = None
+        layout = QVBoxLayout(self)
+        row = QHBoxLayout()
+        layout.addLayout(row)
+        self.curve, self.point, self.sensor = QComboBox(), QComboBox(), QComboBox()
+        for label, box in [('曲线', self.curve), ('转速点', self.point), ('传感器', self.sensor)]:
+            row.addWidget(QLabel(label))
+            row.addWidget(box, 1)
+        self.point.setToolTip('实测平均转速及其对应的转频：Hz = RPM ÷ 60。')
+        self.calculate = button(row, '计算 FFT 和 Welch', calculate)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.plot_area = QVBoxLayout()
+        layout.addLayout(self.plot_area, 1)
+        self.curve.addItems([curve.label for curve in self.curves])
+        self.curve.currentIndexChanged.connect(self.update_points)
+        self.point.currentIndexChanged.connect(self.update_sensors)
+        self.sensor.currentIndexChanged.connect(self.reset_preview)
+        self.update_points()
 
-    def refresh_image(self):
-        canvas = self.figure.canvas
-        rgba = canvas.buffer_rgba()  # Already drawn when the report PNG was saved.
-        h, w, _ = rgba.shape
-        self.original = QPixmap.fromImage(QImage(rgba, w, h, 4 * w, QImage.Format.Format_RGBA8888))
-        self.fit_image()
+    def update_points(self):
+        self.point.clear()
+        if self.curve.currentIndex() >= 0:
+            for point, rpm, _ in self.curves[self.curve.currentIndex()].points:
+                speed = '转速缺测' if rpm is None else f'{rpm:.1f} RPM（{rpm / 60:.2f} Hz）'
+                self.point.addItem(f'测点 {point} · {speed}', point)
+        self.update_sensors()
 
-    def fit_image(self):
-        size = self.contentsRect().size()
-        if not size.isEmpty():
-            self.setPixmap(self.original.scaled(size, Qt.AspectRatioMode.KeepAspectRatio,
-                                               Qt.TransformationMode.SmoothTransformation))
+    def update_sensors(self):
+        self.sensor.clear()
+        if self.point.currentIndex() >= 0:
+            _, _, sensors = self.curves[self.curve.currentIndex()].points[self.point.currentIndex()]
+            for key, name in [('accel', '加速度计'), ('gyro', '陀螺仪')]:
+                if key in sensors:
+                    self.sensor.addItem(name, key)
+        self.reset_preview()
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.fit_image()
+    def reset_preview(self):
+        if self.preview is not None:
+            self.plot_area.removeWidget(self.preview)
+            self.preview.deleteLater()
+            self.preview = None
+        ready = self.sensor.currentIndex() >= 0
+        self.calculate.setEnabled(ready)
+        self.status.setText('选好曲线和测点后，点击“计算 FFT 和 Welch”。' if ready else '没有可分析的采样。')
 
-    def mousePressEvent(self, event):
-        if event.button() != Qt.MouseButton.LeftButton or self.pixmap().isNull():
-            return super().mousePressEvent(event)
-        # The centered preview may be letterboxed. Convert Qt coordinates (top left)
-        # to the Agg renderer's coordinates (bottom left) before testing the legend.
-        size = self.pixmap().size()
-        rect = self.contentsRect()
-        left = rect.x() + (rect.width() - size.width()) / 2
-        top = rect.y() + (rect.height() - size.height()) / 2
-        x = (event.position().x() - left) * self.original.width() / size.width()
-        y = (1 - (event.position().y() - top) / size.height()) * self.original.height()
-        renderer = self.figure.canvas.get_renderer()
-        for ax in self.figure.axes:
-            legend = ax.get_legend()
-            if legend is None:
-                continue
-            for text, handle in zip(legend.get_texts(), legend.legend_handles):
-                box = text.get_window_extent(renderer)
-                # Include the swatch and the gap before its label (also for scatter handles).
-                swatch = renderer.points_to_pixels(text.get_fontsize()) * (legend.handlelength + legend.handletextpad)
-                if box.x0 - swatch <= x <= box.x1 and box.y0 <= y <= box.y1:
-                    label = text.get_text()
-                    artists = [a for a in (*ax.lines, *ax.collections)
-                               if a.get_label() == label or a.get_gid() == label]
-                    if artists:
-                        visible = not artists[0].get_visible()
-                        for artist in artists:
-                            artist.set_visible(visible)
-                        for item in (handle, text):
-                            item.set_alpha(1 if visible else .35)
-                        self.figure.canvas.draw()
-                        self.refresh_image()
-                    return
-        super().mousePressEvent(event)
+    def show_result(self, _, message, figures):
+        self.preview = CurvePreview(figures['fft'], min_plot_height=1050)
+        self.plot_area.addWidget(self.preview)
+        self.status.setText(message)
 
 
 class AnalysisPanel(QWidget):
@@ -95,6 +92,7 @@ class AnalysisPanel(QWidget):
         super().__init__()
         self.settings = settings
         self.task = self.report = self.saved_report = self.preview = None
+        self.fft = None
         self.waveforms = {}
         local = QVBoxLayout(self)
         row = QHBoxLayout()
@@ -117,6 +115,8 @@ class AnalysisPanel(QWidget):
     def controls(self):
         self.clear_btn.setEnabled(self.task is None and self.report is not None)
         self.choose.setEnabled(self.task is None)
+        if self.fft is not None:
+            self.fft.setEnabled(self.task is None)
         self.save_report_btn.setEnabled(self.report is not None and self.task is None)
         self.open_report.setEnabled(self.saved_report is not None)
 
@@ -145,6 +145,7 @@ class AnalysisPanel(QWidget):
         self.show_report(folder, message, figures)
 
     def clear_views(self):
+        self.fft = None
         while self.views.count():
             widget = self.views.widget(0)
             self.views.removeTab(0)
@@ -193,10 +194,22 @@ class AnalysisPanel(QWidget):
         self.saved_report = folder
         self.show_report(folder, message, figures)
 
-    def run_task(self, task, on_result, message):
+    def start_fft(self):
+        view = self.fft
+        if self.task is not None or view is None or view.sensor.currentIndex() < 0:
+            return
+        view.reset_preview()
+        path = view.curves[view.curve.currentIndex()].samples
+        task = Analysis(path, view.point.currentData(), view.sensor.currentData(), operation=render_fft)
+        self.run_task(task, view.show_result, '正在计算所选测点的 FFT 和 Welch…', status=view.status)
+
+    def run_task(self, task, on_result, message, *, status=None):
         self.remember_view()
         self.activated.emit()
-        self.info.setText(message)
+        if status is None:
+            status = self.info
+        self.task_status = status
+        status.setText(message)
         self.task = task
         task.result.connect(on_result)
         task.error.connect(self.analysis_error)
@@ -205,9 +218,10 @@ class AnalysisPanel(QWidget):
         task.start()
 
     def analysis_error(self, text):
-        self.info.setText("分析失败：" + text)
+        self.task_status.setText("分析失败：" + text)
 
     def analysis_done(self):
+        self.task_status = None
         self.task.deleteLater()
         self.task = None
         self.controls()
@@ -240,6 +254,8 @@ class AnalysisPanel(QWidget):
                         table.setItem(i, j, QTableWidgetItem(value))
                 table.resizeColumnsToContents()
                 self.views.addTab(table, title)
+        self.fft = FFTView(self.waveforms, self.start_fft)
+        self.views.addTab(self.fft, 'FFT 分析')
         preferred = self.settings.value('analysis/view', '', type=str)
         restore_tab(self.views, preferred)
         self.controls()

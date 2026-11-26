@@ -15,8 +15,8 @@ from PySide6.QtTest import QTest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "app"))
 
-from imu_analysis_panel import CurvePreview
 from imu_gui import Window
+from imu_plot_view import CurvePreview
 from imu_shell_transport import send_shell
 from imu_ui import last_dir
 from imu_vibration_download import download_file
@@ -38,33 +38,87 @@ class WorkbenchTests(unittest.TestCase):
             self.app.processEvents()
         self.assertIsNone(panel.task, panel.info.text())
 
-    def test_curve_preview_fits_available_width_and_height(self):
-        from matplotlib.backends.backend_agg import FigureCanvasAgg
+    def test_plot_wheel_navigation_and_shared_axis(self):
+        from matplotlib.backend_bases import MouseEvent
         from matplotlib.figure import Figure
 
-        fig = Figure(figsize=(4, 2), dpi=100)
-        FigureCanvasAgg(fig).draw()
+        fig = Figure(figsize=(4, 4))
+        top, bottom = fig.subplots(2, 1, sharex=True)
+        for ax in (top, bottom):
+            ax.plot([0, 10], [0, 20])
         preview = CurvePreview(fig)
+        preview.resize(850, 500)
         preview.show()
-        for width, height, expected in [(1200, 800, (1200, 600)), (700, 200, (400, 200)), (200, 160, (200, 100))]:
-            preview.resize(width, height)
-            self.app.processEvents()
-            self.assertEqual(preview.pixmap().size().toTuple(), expected)
+        self.app.processEvents()
+        canvas = preview.canvas
+        canvas.draw()
+        original, bottom_y = top.get_xlim(), bottom.get_ylim()
+        x, y = top.transData.transform((2, 4))
+        event = MouseEvent('scroll_event', canvas, x, y, step=1)
+        canvas.callbacks.process('scroll_event', event)
+        zoomed = top.get_xlim()
+        self.assertAlmostEqual(zoomed[0], 2 + (original[0] - 2) / 1.25)
+        self.assertEqual(bottom.get_xlim(), zoomed)
+        self.assertEqual(bottom.get_ylim(), bottom_y)
+        preview.toolbar.back()
+        self.assertEqual(top.get_xlim(), original)
+        preview.toolbar.forward()
+        self.assertEqual(top.get_xlim(), zoomed)
+        canvas.callbacks.process('scroll_event', MouseEvent('scroll_event', canvas, x, y, step=-1))
+        self.assertAlmostEqual(top.get_xlim()[1] - top.get_xlim()[0], original[1] - original[0])
+        preview.toolbar.home()
+        self.assertEqual(top.get_xlim(), original)
+        preview.close()
+
+    def test_plot_toolbar_box_zoom_and_pan(self):
+        from matplotlib.figure import Figure
+
+        fig = Figure()
+        ax = fig.subplots()
+        ax.plot([0, 10], [0, 10])
+        preview = CurvePreview(fig)
+        preview.resize(800, 500)
+        preview.show()
+        self.app.processEvents()
+        canvas = preview.canvas
+
+        def drag(start, stop):
+            canvas.draw()
+            ratio = canvas.devicePixelRatioF()
+            def position(xy):
+                x, y = ax.transData.transform(xy)
+                return QPoint(round(x / ratio), round(canvas.height() - y / ratio))
+            a, b = position(start), position(stop)
+            QTest.mousePress(canvas, Qt.MouseButton.LeftButton, pos=a)
+            QTest.mouseMove(canvas, b)
+            QTest.mouseRelease(canvas, Qt.MouseButton.LeftButton, pos=b)
+
+        preview.toolbar.zoom()
+        drag((2, 2), (8, 8))
+        x0, x1 = ax.get_xlim()
+        self.assertAlmostEqual(x0, 2, delta=.1)
+        self.assertAlmostEqual(x1, 8, delta=.1)
+        preview.toolbar.pan()
+        drag((3, 3), (4, 3))
+        left, right = ax.get_xlim()
+        self.assertAlmostEqual(left, x0 - 1, delta=.1)
+        self.assertAlmostEqual(right - left, x1 - x0)
         preview.close()
 
     def click_legend(self, preview, ax, entry, swatch=False):
         legend = ax.get_legend()
         text = legend.get_texts()[entry]
-        renderer = preview.figure.canvas.get_renderer()
+        canvas = preview.canvas
+        canvas.draw()
+        renderer = canvas.get_renderer()
         box = text.get_window_extent(renderer)
         x = (box.x0 + box.x1) / 2
         if swatch:
             x = box.x0 - renderer.points_to_pixels(text.get_fontsize()) * (legend.handletextpad + legend.handlelength / 2)
-        size = preview.pixmap().size()
+        ratio = canvas.devicePixelRatioF()
         y = (box.y0 + box.y1) / 2
-        point = QPoint(round((preview.width() - size.width()) / 2 + x * size.width() / preview.original.width()),
-                       round((preview.height() - size.height()) / 2 + size.height() * (1 - y / preview.original.height())))
-        QTest.mouseClick(preview, Qt.MouseButton.LeftButton, pos=point)
+        point = QPoint(round(x / ratio), round(canvas.height() - y / ratio))
+        QTest.mouseClick(canvas, Qt.MouseButton.LeftButton, pos=point)
 
     def test_menu_order_and_old_selection(self):
         with TemporaryDirectory() as d:
@@ -168,6 +222,16 @@ class WorkbenchTests(unittest.TestCase):
                 self.assertEqual(len(gyro_rms.lines), 2)
             with (w.analysis.report / 'summary.csv').open() as stream:
                 self.assertEqual({r['waveform'] for r in csv.DictReader(stream)}, {'1. first.csv', '2. second.csv'})
+            fft = w.analysis.fft
+            fft.curve.setCurrentIndex(1)
+            self.assertEqual(fft.curves[1].samples, paths[1].resolve())
+            self.assertEqual([fft.point.itemData(i) for i in range(fft.point.count())], [0, 4, 3])
+            self.assertEqual(fft.point.itemText(0), '测点 0 · 0.0 RPM（0.00 Hz）')
+            self.assertEqual(fft.point.itemText(2), '测点 3 · 2300.0 RPM（38.33 Hz）')
+            fft.calculate.click()
+            self.wait_for_analysis(w.analysis)
+            self.assertIn('timestamp_sample_us', fft.status.text())
+            self.assertTrue(fft.calculate.isEnabled())
             w.analysis.views.setCurrentIndex(0)
             preview = w.analysis.views.currentWidget()
             ax = preview.figure.axes[0]
@@ -207,7 +271,54 @@ class WorkbenchTests(unittest.TestCase):
                 w.analysis.open_local()
                 select_dir.assert_not_called()
             self.wait_for_analysis(w.analysis)
-            self.assertEqual(w.analysis.views.count(), 7, w.analysis.info.text())
+            self.assertEqual(w.analysis.views.count(), 8, w.analysis.info.text())
+            fft = w.analysis.fft
+            w.analysis.views.setCurrentWidget(fft)
+            fft.point.setCurrentIndex(1)
+            self.assertIsNone(fft.preview)
+            self.assertIsNone(w.analysis.task)
+            fft.calculate.click()
+            self.wait_for_analysis(w.analysis)
+            self.assertIsNotNone(fft.preview, fft.status.text())
+            w.show()
+            canvas = fft.preview.canvas
+            ax, welch = canvas.figure.axes
+            self.assertEqual([ax.get_title(), welch.get_title()], ['FFT', 'Welch PSD'])
+            self.assertTrue(ax.get_shared_x_axes().joined(ax, welch))
+            for panel in (ax, welch):
+                self.assertEqual([line.get_label() for line in panel.lines], ['X', 'Y', 'Z', 'Magnitude'])
+            with patch('imu_fft.read_point_samples', side_effect=AssertionError('FFT on resize')):
+                for width in (1100, 1300):
+                    w.resize(width, 800)
+                    self.app.processEvents()
+                    ratio = canvas.devicePixelRatioF()
+                    h, pixels, _ = canvas.buffer_rgba().shape
+                    self.assertAlmostEqual(pixels, canvas.width() * ratio, delta=1)
+                    self.assertAlmostEqual(h, canvas.height() * ratio, delta=1)
+                area = fft.preview.scroll_area
+                bar = area.verticalScrollBar()
+                self.assertGreater(bar.maximum(), 0)
+                self.assertEqual(canvas.width(), area.viewport().width())
+                limits = ax.get_xlim(), ax.get_ylim()
+                pos = area.viewport().mapTo(w, area.viewport().rect().center())
+                QTest.wheelEvent(w.windowHandle(), pos, QPoint(0, -120))
+                self.app.processEvents()
+                self.assertGreater(bar.value(), 0)
+                self.assertEqual((ax.get_xlim(), ax.get_ylim()), limits)
+                QTest.wheelEvent(w.windowHandle(), pos, QPoint(0, 120))
+                self.app.processEvents()
+                self.assertEqual(bar.value(), 0)
+                box = ax.get_legend().get_texts()[-1].get_window_extent(canvas.get_renderer())
+                pos = QPoint(round((box.x0 + box.x1) / (2 * ratio)),
+                             round(canvas.height() - (box.y0 + box.y1) / (2 * ratio)))
+                QTest.mouseClick(canvas, Qt.MouseButton.LeftButton, pos=pos)
+                self.assertFalse(ax.lines[-1].get_visible())
+            self.assertIn('400.00 Hz', fft.status.text())
+            self.assertIn('Welch', fft.status.text())
+            self.assertIn('/Hz', welch.get_ylabel())
+            fft.point.setCurrentIndex(0)
+            self.assertIsNone(fft.preview)
+            self.assertIsNone(w.analysis.task)
             for axis in "xyz":
                 self.assertTrue((w.analysis.report / f"main_rpm_{axis}_mean_rms.png").is_file())
             self.assertFalse((w.analysis.report / "main_rpm_mean_rms.png").exists())
